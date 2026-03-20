@@ -1,17 +1,24 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strconv"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 // ── Wire форматы ──────────────────────────────────────────────────────────────
@@ -46,13 +53,47 @@ type EncryptedBody struct {
 // ── Proxy Handler ─────────────────────────────────────────────────────────────
 
 type ProxyHandler struct {
-	cfg           *Config
+	cfg           atomic.Pointer[Config]
 	store         *SessionStore
-	serverECDH    *DHKeyPair // ECDH ключ для начального key agreement
-	serverRatchet *DHKeyPair // DH ключ для инициализации Double Ratchet
+	serverECDH    *DHKeyPair         // ECDH ключ для начального key agreement
+	serverRatchet *DHKeyPair         // DH ключ для инициализации Double Ratchet
 	plain         *httputil.ReverseProxy
-	client        *http.Client     // HTTP клиент для запросов к бэкенду
+	client        *http.Client       // HTTP клиент для запросов к бэкенду
 	upgrader      websocket.Upgrader // WebSocket upgrader
+	startTime     time.Time          // время запуска для /health
+	rateLimiter   *IPRateLimiter     // rate limiter для /ratchet/init
+	m             *proxyMetrics      // Prometheus метрики
+	metricsReg    *prometheus.Registry
+	wsWg          sync.WaitGroup     // graceful shutdown WS соединений
+	cb            *CircuitBreaker    // circuit breaker для бэкенда
+}
+
+// WaitWS ждёт завершения всех активных WebSocket соединений.
+func (h *ProxyHandler) WaitWS() {
+	h.wsWg.Wait()
+}
+
+// statusRecorder оборачивает ResponseWriter для захвата статус-кода.
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (sr *statusRecorder) WriteHeader(code int) {
+	sr.status = code
+	sr.ResponseWriter.WriteHeader(code)
+}
+
+func (sr *statusRecorder) Status() int {
+	if sr.status == 0 {
+		return http.StatusOK
+	}
+	return sr.status
+}
+
+// Hijack реализует http.Hijacker — делегирует к базовому ResponseWriter.
+func (sr *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return sr.ResponseWriter.(http.Hijacker).Hijack()
 }
 
 func newProxyHandler(cfg *Config) (*ProxyHandler, error) {
@@ -73,7 +114,6 @@ func newProxyHandler(cfg *Config) (*ProxyHandler, error) {
 
 	// ReverseProxy для plain маршрутов
 	rp := httputil.NewSingleHostReverseProxy(backendURL)
-	rp.ErrorLog = log.Default()
 
 	// HTTP клиент для зашифрованных маршрутов (ручное проксирование)
 	transport := &http.Transport{
@@ -84,33 +124,58 @@ func newProxyHandler(cfg *Config) (*ProxyHandler, error) {
 	}
 	client := &http.Client{Transport: transport, Timeout: 30 * time.Second}
 
-	log.Printf("[proxy] ECDH key:    %s...", serverECDH.PubHex[:20])
-	log.Printf("[proxy] Ratchet key: %s...", serverRatchet.PubHex[:20])
+	slog.Info("keys ready",
+		"ecdh", serverECDH.PubHex[:20],
+		"ratchet", serverRatchet.PubHex[:20])
 
-	return &ProxyHandler{
-		cfg:           cfg,
-		store:         newSessionStore(cfg.SessionTTL),
+	reg := prometheus.NewRegistry()
+	m := newMetrics(reg)
+
+	h := &ProxyHandler{
+		store:         newSessionStoreWithMax(cfg.SessionTTL, cfg.MaxSessions),
 		serverECDH:    serverECDH,
 		serverRatchet: serverRatchet,
 		plain:         rp,
 		client:        client,
-		upgrader: websocket.Upgrader{
-			CheckOrigin:     func(r *http.Request) bool { return true },
-			ReadBufferSize:  4096,
-			WriteBufferSize: 4096,
-		},
-	}, nil
+		startTime:     time.Now(),
+		rateLimiter:   newIPRateLimiter(cfg.RateLimit.RPS, cfg.RateLimit.Burst),
+		upgrader:      buildUpgrader(cfg),
+		m:             m,
+		metricsReg:    reg,
+		cb:            newCircuitBreaker(cfg.CircuitBreaker.Threshold, cfg.CircuitBreaker.Timeout),
+	}
+	h.cfg.Store(cfg)
+	return h, nil
 }
 
 func (h *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Служебные эндпоинты прокси
-	if r.URL.Path == h.cfg.InitPath {
+	cfg := h.cfg.Load()
+	if r.URL.Path == cfg.HealthPath {
+		h.handleHealth(w, r)
+		return
+	}
+	if r.URL.Path == cfg.MetricsPath {
+		promhttp.HandlerFor(h.metricsReg, promhttp.HandlerOpts{}).ServeHTTP(w, r)
+		return
+	}
+	if r.URL.Path == cfg.InitPath {
 		h.handleInit(w, r)
 		return
 	}
 
+	// Трекинг метрик для всех остальных запросов
+	sr := &statusRecorder{ResponseWriter: w}
+	start := time.Now()
+	defer func() {
+		h.m.requestsTotal.WithLabelValues(r.URL.Path, r.Method, strconv.Itoa(sr.Status())).Inc()
+		h.m.requestDuration.WithLabelValues(r.URL.Path).Observe(time.Since(start).Seconds())
+		h.m.activeSessions.Set(float64(h.store.Count()))
+	}()
+	w = sr
+
 	// Маршрутизация по конфигу
-	rule := h.cfg.matchRoute(r.URL.Path, r.Method)
+	rule := cfg.matchRoute(r.URL.Path, r.Method)
 
 	// WebSocket upgrade
 	if isWebSocketUpgrade(r) {
@@ -141,8 +206,24 @@ func (h *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// handleHealth отдаёт статус сервера без проксирования на бэкенд.
+func (h *ProxyHandler) handleHealth(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"status":   "ok",
+		"sessions": h.store.Count(),
+		"uptime":   time.Since(h.startTime).Round(time.Second).String(),
+	})
+}
+
 // handleInit выдаёт ключи сервера и создаёт слот сессии
 func (h *ProxyHandler) handleInit(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.Load().RateLimit.Enabled && !h.rateLimiter.Allow(clientIP(r)) {
+		h.m.rateLimitRejects.Inc()
+		jsonError(w, "rate limit exceeded", http.StatusTooManyRequests)
+		return
+	}
+
 	sid, err := newSessionID()
 	if err != nil {
 		http.Error(w, `{"error":"internal error"}`, http.StatusInternalServerError)
@@ -191,11 +272,14 @@ func (h *ProxyHandler) handleEncrypted(w http.ResponseWriter, r *http.Request) {
 		}
 		sess, err = h.initSession(req.ECDHPublicKey)
 		if err != nil {
-			log.Printf("[proxy] session init error: %v", err)
+			slog.Error("session init", "err", err)
 			jsonError(w, "handshake failed", http.StatusBadRequest)
 			return
 		}
-		h.store.Set(sid, sess)
+		if err := h.store.Set(sid, sess); err != nil {
+			jsonError(w, "session limit reached", http.StatusServiceUnavailable)
+			return
+		}
 	}
 
 	// Расшифровываем запрос
@@ -207,7 +291,8 @@ func (h *ProxyHandler) handleEncrypted(w http.ResponseWriter, r *http.Request) {
 	}
 	plaintext, err := sess.Decrypt(pkt)
 	if err != nil {
-		log.Printf("[proxy] decrypt error: %v", err)
+		h.m.decryptErrors.Inc()
+		slog.Error("decrypt", "err", err)
 		jsonError(w, "decryption failed", http.StatusBadRequest)
 		return
 	}
@@ -219,15 +304,25 @@ func (h *ProxyHandler) handleEncrypted(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("[proxy] msg #%d | %s %s | DH: %s...",
-		req.Header.N, encBody.Method, encBody.Path, req.Header.DH[:16])
+	slog.Debug("msg", "n", req.Header.N, "method", encBody.Method, "path", encBody.Path, "dh", req.Header.DH[:16])
 
-	// Пересылаем на бэкенд
+	// Пересылаем на бэкенд (с circuit breaker)
+	cbEnabled := h.cfg.Load().CircuitBreaker.Enabled
+	if cbEnabled && !h.cb.Allow() {
+		jsonError(w, "backend circuit open", http.StatusBadGateway)
+		return
+	}
 	backendResp, err := h.forwardToBackend(r, &encBody)
 	if err != nil {
-		log.Printf("[proxy] backend error: %v", err)
+		if cbEnabled {
+			h.cb.RecordFailure()
+		}
+		slog.Error("backend", "err", err)
 		jsonError(w, "backend error", http.StatusBadGateway)
 		return
+	}
+	if cbEnabled {
+		h.cb.RecordSuccess()
 	}
 	defer backendResp.Body.Close()
 
@@ -248,7 +343,8 @@ func (h *ProxyHandler) handleEncrypted(w http.ResponseWriter, r *http.Request) {
 	// Шифруем ответ
 	respPkt, err := sess.Encrypt(encRespJSON)
 	if err != nil {
-		log.Printf("[proxy] encrypt error: %v", err)
+		h.m.encryptErrors.Inc()
+		slog.Error("encrypt", "err", err)
 		jsonError(w, "encryption failed", http.StatusInternalServerError)
 		return
 	}
@@ -283,7 +379,7 @@ func (h *ProxyHandler) forwardToBackend(origReq *http.Request, enc *EncryptedBod
 		path = origReq.URL.RequestURI()
 	}
 
-	targetURL := h.cfg.Backend + path
+	targetURL := h.cfg.Load().Backend + path
 
 	var bodyReader io.Reader
 	if enc.Body != "" {
@@ -320,6 +416,19 @@ func extractHeaders(h http.Header) map[string]string {
 		}
 	}
 	return out
+}
+
+// reloadConfig атомарно заменяет конфиг из файла.
+// НЕ перезагружает: Listen, Backend, InitPath (требуют рестарт).
+func (h *ProxyHandler) reloadConfig(path string) error {
+	newCfg, err := loadConfig(path)
+	if err != nil {
+		return fmt.Errorf("reload config: %w", err)
+	}
+	h.cfg.Store(newCfg)
+	h.upgrader = buildUpgrader(newCfg)
+	slog.Info("config reloaded", "path", path)
+	return nil
 }
 
 func jsonError(w http.ResponseWriter, msg string, code int) {

@@ -4,9 +4,11 @@ import (
 	"context"
 	"flag"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -20,9 +22,12 @@ func main() {
 		log.Fatalf("Config error: %v", err)
 	}
 
+	initLogger(cfg.LogLevel, cfg.LogFormat)
+
 	handler, err := newProxyHandler(cfg)
 	if err != nil {
-		log.Fatalf("Init error: %v", err)
+		slog.Error("init failed", "err", err)
+		os.Exit(1)
 	}
 
 	srv := &http.Server{
@@ -33,42 +38,59 @@ func main() {
 		IdleTimeout:  120 * time.Second,
 	}
 
+	// Hot reload on SIGHUP
+	reload := make(chan os.Signal, 1)
+	signal.Notify(reload, syscall.SIGHUP)
+	go func() {
+		for range reload {
+			slog.Info("SIGHUP received, reloading config")
+			if err := handler.reloadConfig(*cfgPath); err != nil {
+				slog.Error("reload failed", "err", err)
+			}
+		}
+	}()
+
 	// Graceful shutdown
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
-		log.Printf("[proxy] Listening on %s → backend %s", cfg.Listen, cfg.Backend)
-		log.Printf("[proxy] Init endpoint: %s", cfg.InitPath)
+		slog.Info("proxy started", "listen", cfg.Listen, "backend", cfg.Backend, "init_path", cfg.InitPath)
 		printRoutes(cfg)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("Server error: %v", err)
+			slog.Error("server error", "err", err)
+			os.Exit(1)
 		}
 	}()
 
 	<-stop
-	log.Println("[proxy] Shutting down...")
+	slog.Info("shutting down")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(ctx); err != nil {
-		log.Printf("Shutdown error: %v", err)
+		slog.Error("shutdown error", "err", err)
 	}
-	log.Println("[proxy] Stopped")
+
+	// Ждём завершения всех WebSocket соединений (до 30 секунд)
+	wsDone := make(chan struct{})
+	go func() {
+		handler.WaitWS()
+		close(wsDone)
+	}()
+	select {
+	case <-wsDone:
+	case <-time.After(30 * time.Second):
+		slog.Warn("ws connections did not finish in time")
+	}
+	slog.Info("stopped")
 }
 
 func printRoutes(cfg *Config) {
-	log.Printf("[proxy] Routes:")
 	for _, r := range cfg.Routes {
 		methods := "*"
 		if len(r.Methods) > 0 {
-			methods = ""
-			for i, m := range r.Methods {
-				if i > 0 {
-					methods += ","
-				}
-				methods += m
-			}
+			methods = strings.Join(r.Methods, ",")
 		}
-		log.Printf("[proxy]   [%s] %-6s  %s", r.Mode, methods, r.Path)
+		slog.Info("route", "mode", r.Mode, "methods", methods, "path", r.Path)
 	}
 }
