@@ -1,0 +1,65 @@
+# Encrypt Proxy Configuration
+
+# Адрес на котором слушает прокси
+listen: ":8080"
+
+# URL бэкенда (nginx, любой HTTP сервер)
+backend: "http://127.0.0.1:8090"
+
+# Время жизни сессии рatchet
+session_ttl: "1h"
+
+# Служебные пути прокси (не уходят на бэкенд)
+init_path: "/ratchet/init"
+api_path: "/ratchet/api"
+
+# ─────────────────────────────────────────────
+# Маршруты (первое совпадение побеждает)
+#
+# mode: "encrypt" — запрос расшифровывается → бэкенд → ответ шифруется
+# mode: "plain"   — запрос пересылается как есть (GET страницы, статика)
+#
+# path: если заканчивается на '/'  → prefix match (всё что начинается с этого пути)
+#       если без '/' в конце       → exact match
+#
+# methods: список HTTP методов (пусто = все методы)
+# ─────────────────────────────────────────────
+
+routes:
+  # API — все запросы шифруются
+  - path: "/api/"
+    mode: encrypt
+
+  # Авторизация — шифруется
+  - path: "/auth/"
+    mode: encrypt
+    methods: [POST, PUT]
+
+  # Вебхуки — шифруются
+  - path: "/webhook/"
+    mode: encrypt
+    methods: [POST]
+
+  # Главная страница — plain (человекочитаемый GET)
+  - path: "/"
+    mode: plain
+    methods: [GET]
+
+  # Статические файлы — plain
+  - path: "/static/"
+    mode: plain
+    methods: [GET, HEAD]
+
+  # Страницы сайта — plain
+  - path: "/about"
+    mode: plain
+    methods: [GET]
+
+  - path: "/docs/"
+    mode: plain
+    methods: [GET]
+
+  # Health check nginx — plain
+  - path: "/health"
+    mode: plain
+    methods: [GET]

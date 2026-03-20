@@ -1,0 +1,125 @@
+package main
+
+import (
+	"fmt"
+	"os"
+	"strings"
+	"time"
+
+	"gopkg.in/yaml.v3"
+)
+
+// Config — полная конфигурация прокси
+type Config struct {
+	Listen     string        `yaml:"listen"`      // адрес для входящих соединений, напр. ":8080"
+	Backend    string        `yaml:"backend"`     // URL бэкенда, напр. "http://127.0.0.1:80"
+	SessionTTL time.Duration `yaml:"session_ttl"` // время жизни сессии, напр. "1h"
+
+	// Маршруты: список правил. Первое совпадение побеждает.
+	Routes []RouteRule `yaml:"routes"`
+
+	// Служебные пути прокси (не проксируются на бэкенд)
+	InitPath string `yaml:"init_path"` // GET /ratchet/init  — по умолчанию "/ratchet/init"
+	APIPath  string `yaml:"api_path"`  // POST /ratchet/api  — по умолчанию "/ratchet/api"
+}
+
+// RouteRule описывает одно правило маршрутизации
+type RouteRule struct {
+	// Путь или префикс. Если заканчивается на '/', то prefix match, иначе exact match.
+	Path string `yaml:"path"`
+
+	// Режим:
+	//   "encrypt"   — запрос расшифровывается, пересылается на бэкенд, ответ шифруется
+	//   "plain"     — запрос пересылается на бэкенд как есть (GET страницы, статика)
+	Mode string `yaml:"mode"`
+
+	// Методы HTTP которые разрешены (опционально, пусто = все)
+	Methods []string `yaml:"methods,omitempty"`
+}
+
+func loadConfig(path string) (*Config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read config %s: %w", path, err)
+	}
+
+	var cfg Config
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("parse config: %w", err)
+	}
+
+	// Дефолтные значения
+	if cfg.Listen == "" {
+		cfg.Listen = ":8080"
+	}
+	if cfg.Backend == "" {
+		cfg.Backend = "http://127.0.0.1:80"
+	}
+	if cfg.SessionTTL == 0 {
+		cfg.SessionTTL = time.Hour
+	}
+	if cfg.InitPath == "" {
+		cfg.InitPath = "/ratchet/init"
+	}
+	if cfg.APIPath == "" {
+		cfg.APIPath = "/ratchet/api"
+	}
+
+	if err := cfg.validate(); err != nil {
+		return nil, err
+	}
+	return &cfg, nil
+}
+
+func (cfg *Config) validate() error {
+	for i, r := range cfg.Routes {
+		if r.Path == "" {
+			return fmt.Errorf("routes[%d]: path is empty", i)
+		}
+		if r.Mode != "encrypt" && r.Mode != "plain" {
+			return fmt.Errorf("routes[%d]: mode must be 'encrypt' or 'plain', got %q", i, r.Mode)
+		}
+	}
+	return nil
+}
+
+// BackendWSURL возвращает URL бэкенда для WebSocket соединений.
+func (cfg *Config) BackendWSURL() string {
+	if strings.HasPrefix(cfg.Backend, "https://") {
+		return "wss://" + cfg.Backend[len("https://"):]
+	}
+	return "ws://" + strings.TrimPrefix(cfg.Backend, "http://")
+}
+
+// matchRoute возвращает RouteRule для данного пути/метода, или nil если нет совпадения.
+// Первое совпадение побеждает.
+func (cfg *Config) matchRoute(path, method string) *RouteRule {
+	for i := range cfg.Routes {
+		r := &cfg.Routes[i]
+		// Path matching
+		if strings.HasSuffix(r.Path, "/") {
+			if !strings.HasPrefix(path, r.Path) {
+				continue
+			}
+		} else {
+			if path != r.Path {
+				continue
+			}
+		}
+		// Method matching (пусто = все методы)
+		if len(r.Methods) > 0 {
+			matched := false
+			for _, m := range r.Methods {
+				if strings.EqualFold(m, method) {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				continue
+			}
+		}
+		return r
+	}
+	return nil
+}
