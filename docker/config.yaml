@@ -1,0 +1,47 @@
+# Encrypt Proxy — Docker config
+listen: ":8080"
+backend: "${BACKEND_URL:-http://backend:8090}"
+session_ttl: "1h"
+
+init_path: "/ratchet/init"
+api_path:  "/ratchet/api"
+health_path: "/health"
+metrics_path: "/metrics"
+
+log_level:  "${LOG_LEVEL:-debug}"
+log_format: "json"
+
+rate_limit:
+  enabled: false
+
+max_sessions: 10000
+ws_max_message_bytes: 65536
+
+circuit_breaker:
+  enabled: true
+  threshold: 5
+  timeout: "10s"
+
+routes:
+  - path: "/api/"
+    mode: encrypt
+
+  - path: "/auth/"
+    mode: encrypt
+    methods: [POST, PUT]
+
+  - path: "/webhook/"
+    mode: encrypt
+    methods: [POST]
+
+  - path: "/health"
+    mode: plain
+    methods: [GET]
+
+  - path: "/static/"
+    mode: plain
+    methods: [GET, HEAD]
+
+  - path: "/"
+    mode: plain
+    methods: [GET]

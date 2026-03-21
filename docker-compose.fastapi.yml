@@ -1,0 +1,22 @@
+# Override: replace nginx backend with FastAPI (Python)
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.fastapi.yml up
+#   docker compose -f docker-compose.yml -f docker-compose.fastapi.yml --profile test up --abort-on-container-exit
+
+services:
+  backend:
+    build:
+      context: ./docker/fastapi
+    image: ""       # clear image so build is used
+    volumes: []     # clear nginx volume mount
+    environment:
+      PORT: "8090"
+    expose:
+      - "8090"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8090/health')\""]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s

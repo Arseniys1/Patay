@@ -1,0 +1,19 @@
+# Override: replace nginx backend with Apache (PHP)
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.apache.yml up
+#   docker compose -f docker-compose.yml -f docker-compose.apache.yml --profile test up --abort-on-container-exit
+
+services:
+  backend:
+    build:
+      context: ./docker/apache
+    image: ""       # clear image so build is used
+    volumes: []     # clear nginx volume mount
+    expose:
+      - "8090"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8090/health | grep -q ok"]
+      interval: 5s
+      timeout: 3s
+      retries: 5

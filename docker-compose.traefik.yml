@@ -1,0 +1,34 @@
+# Overlay: add Traefik in front of the encrypt proxy
+#
+# Architecture: client → traefik:80 → proxy:8080 → backend:8090
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.traefik.yml up
+#   docker compose -f docker-compose.yml -f docker-compose.traefik.yml --profile test up --abort-on-container-exit
+
+services:
+
+  traefik:
+    image: traefik:v3.3
+    volumes:
+      - ./docker/traefik/traefik.yml:/etc/traefik/traefik.yml:ro
+      - ./docker/traefik/dynamic.yml:/etc/traefik/dynamic.yml:ro
+    expose:
+      - "80"
+    depends_on:
+      proxy:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "traefik", "healthcheck", "--ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  client:
+    environment:
+      PROXY_URL: "http://traefik:80"
+    depends_on:
+      traefik:
+        condition: service_healthy

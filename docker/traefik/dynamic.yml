@@ -1,0 +1,14 @@
+http:
+  routers:
+    proxy-router:
+      entryPoints:
+        - web
+      rule: "PathPrefix(`/`)"
+      service: proxy-service
+      priority: 1
+
+  services:
+    proxy-service:
+      loadBalancer:
+        servers:
+          - url: "http://proxy:8080"

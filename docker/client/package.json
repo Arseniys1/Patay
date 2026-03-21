@@ -1,0 +1,17 @@
+{
+  "name": "encrypt-proxy-client",
+  "version": "1.0.0",
+  "description": "Axios client for Encrypt Proxy (Double Ratchet + ECDH P-256 + AES-256-GCM)",
+  "main": "src/encrypt-client.js",
+  "scripts": {
+    "test": "node src/test.js",
+    "test:ws": "node src/test-ws.js"
+  },
+  "dependencies": {
+    "axios": "^1.6.8",
+    "ws": "^8.17.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

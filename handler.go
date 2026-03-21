@@ -163,6 +163,10 @@ func (h *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleInit(w, r)
 		return
 	}
+	if r.URL.Path == cfg.APIPath {
+		h.handleEncrypted(w, r)
+		return
+	}
 
 	// Трекинг метрик для всех остальных запросов
 	sr := &statusRecorder{ResponseWriter: w}
