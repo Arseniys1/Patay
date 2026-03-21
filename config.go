@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"regexp"
 	"strings"
@@ -63,6 +64,10 @@ type Config struct {
 
 	// Путь для Prometheus метрик (по умолчанию "/metrics")
 	MetricsPath string `yaml:"metrics_path"`
+
+	// TLS (опционально — если задано, сервер запускается как HTTPS)
+	TLSCert string `yaml:"tls_cert"` // путь к cert.pem
+	TLSKey  string `yaml:"tls_key"`  // путь к key.pem
 
 	// Circuit breaker для бэкенда
 	CircuitBreaker CircuitBreakerConfig `yaml:"circuit_breaker"`
@@ -146,6 +151,10 @@ func loadConfig(path string) (*Config, error) {
 }
 
 func (cfg *Config) validate() error {
+	u, err := url.Parse(cfg.Backend)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		return fmt.Errorf("backend must be http:// or https://, got %q", cfg.Backend)
+	}
 	for i, r := range cfg.Routes {
 		if r.Path == "" {
 			return fmt.Errorf("routes[%d]: path is empty", i)

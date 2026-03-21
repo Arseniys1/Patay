@@ -136,6 +136,7 @@ func (h *ProxyHandler) handlePlainWS(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			setReadDeadline(clientConn)
+			_ = backendConn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
 			if err := backendConn.WriteMessage(msgType, msg); err != nil {
 				return
 			}
@@ -150,6 +151,7 @@ func (h *ProxyHandler) handlePlainWS(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				return
 			}
+			_ = clientConn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
 			if err := clientConn.WriteMessage(msgType, msg); err != nil {
 				return
 			}
@@ -276,6 +278,7 @@ func (h *ProxyHandler) handleEncryptedWS(w http.ResponseWriter, r *http.Request)
 				slog.Error("ws-enc decrypt", "err", err)
 				return
 			}
+			_ = backendConn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
 			if err := backendConn.WriteMessage(websocket.TextMessage, plain); err != nil {
 				return
 			}
@@ -296,6 +299,7 @@ func (h *ProxyHandler) handleEncryptedWS(w http.ResponseWriter, r *http.Request)
 				return
 			}
 			out, _ := json.Marshal(pkt)
+			_ = clientConn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
 			if err := clientConn.WriteMessage(websocket.TextMessage, out); err != nil {
 				return
 			}

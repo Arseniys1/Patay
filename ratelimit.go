@@ -71,20 +71,9 @@ func (rl *IPRateLimiter) cleanupLoop() {
 	}
 }
 
-// clientIP извлекает IP-адрес клиента из запроса.
+// clientIP извлекает IP-адрес клиента только из RemoteAddr.
+// Заголовки X-Real-IP / X-Forwarded-For не используются — их легко подделать.
 func clientIP(r *http.Request) string {
-	if ip := r.Header.Get("X-Real-IP"); ip != "" {
-		return ip
-	}
-	if ip := r.Header.Get("X-Forwarded-For"); ip != "" {
-		// берём первый IP из списка
-		for i := 0; i < len(ip); i++ {
-			if ip[i] == ',' {
-				return ip[:i]
-			}
-		}
-		return ip
-	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		return r.RemoteAddr

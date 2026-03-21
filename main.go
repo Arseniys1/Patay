@@ -55,9 +55,15 @@ func main() {
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
-		slog.Info("proxy started", "listen", cfg.Listen, "backend", cfg.Backend, "init_path", cfg.InitPath)
+		slog.Info("proxy started", "listen", cfg.Listen, "backend", cfg.Backend, "init_path", cfg.InitPath, "tls", cfg.TLSCert != "")
 		printRoutes(cfg)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		var err error
+		if cfg.TLSCert != "" && cfg.TLSKey != "" {
+			err = srv.ListenAndServeTLS(cfg.TLSCert, cfg.TLSKey)
+		} else {
+			err = srv.ListenAndServe()
+		}
+		if err != nil && err != http.ErrServerClosed {
 			slog.Error("server error", "err", err)
 			os.Exit(1)
 		}

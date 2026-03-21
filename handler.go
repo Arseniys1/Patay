@@ -11,7 +11,9 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"path"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -20,6 +22,30 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
+
+// allowedMethods — whitelist допустимых HTTP-методов для проксирования.
+var allowedMethods = map[string]bool{
+	"GET":     true,
+	"POST":    true,
+	"PUT":     true,
+	"DELETE":  true,
+	"PATCH":   true,
+	"HEAD":    true,
+	"OPTIONS": true,
+}
+
+// blockedHeaders — заголовки, которые клиент не должен подменять.
+var blockedHeaders = map[string]bool{
+	"Host":              true,
+	"Authorization":     true,
+	"Cookie":            true,
+	"Set-Cookie":        true,
+	"Connection":        true,
+	"Content-Length":    true,
+	"Transfer-Encoding": true,
+	"X-Forwarded-For":   true,
+	"X-Real-Ip":         true, // canonical form of X-Real-IP
+}
 
 // ── Wire форматы ──────────────────────────────────────────────────────────────
 
@@ -149,6 +175,11 @@ func newProxyHandler(cfg *Config) (*ProxyHandler, error) {
 }
 
 func (h *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Генерируем request ID для трассировки
+	reqID := newRequestID()
+	r = r.WithContext(withRequestID(r.Context(), reqID))
+	w.Header().Set("X-Request-ID", reqID)
+
 	// Служебные эндпоинты прокси
 	cfg := h.cfg.Load()
 	if r.URL.Path == cfg.HealthPath {
@@ -172,8 +203,9 @@ func (h *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	sr := &statusRecorder{ResponseWriter: w}
 	start := time.Now()
 	defer func() {
-		h.m.requestsTotal.WithLabelValues(r.URL.Path, r.Method, strconv.Itoa(sr.Status())).Inc()
-		h.m.requestDuration.WithLabelValues(r.URL.Path).Observe(time.Since(start).Seconds())
+		label := metricPath(cfg, r.URL.Path)
+		h.m.requestsTotal.WithLabelValues(label, r.Method, strconv.Itoa(sr.Status())).Inc()
+		h.m.requestDuration.WithLabelValues(label).Observe(time.Since(start).Seconds())
 		h.m.activeSessions.Set(float64(h.store.Count()))
 	}()
 	w = sr
@@ -212,16 +244,29 @@ func (h *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // handleHealth отдаёт статус сервера без проксирования на бэкенд.
 func (h *ProxyHandler) handleHealth(w http.ResponseWriter, r *http.Request) {
+	cbState := "closed"
+	if h.cb.State() == CBOpen {
+		cbState = "open"
+	} else if h.cb.State() == CBHalfOpen {
+		cbState = "half-open"
+	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"status":   "ok",
-		"sessions": h.store.Count(),
-		"uptime":   time.Since(h.startTime).Round(time.Second).String(),
+		"status":          "ok",
+		"sessions":        h.store.Count(),
+		"uptime":          time.Since(h.startTime).Round(time.Second).String(),
+		"circuit_breaker": cbState,
 	})
 }
 
 // handleInit выдаёт ключи сервера и создаёт слот сессии
 func (h *ProxyHandler) handleInit(w http.ResponseWriter, r *http.Request) {
+	h.setCORSHeaders(w, r)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
 	if h.cfg.Load().RateLimit.Enabled && !h.rateLimiter.Allow(clientIP(r)) {
 		h.m.rateLimitRejects.Inc()
 		jsonError(w, "rate limit exceeded", http.StatusTooManyRequests)
@@ -246,6 +291,12 @@ func (h *ProxyHandler) handleInit(w http.ResponseWriter, r *http.Request) {
 
 // handleEncrypted: расшифровывает запрос → пересылает на бэкенд → шифрует ответ
 func (h *ProxyHandler) handleEncrypted(w http.ResponseWriter, r *http.Request) {
+	h.setCORSHeaders(w, r)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
 	// Читаем тело (лимит 10 MB)
 	raw, err := io.ReadAll(io.LimitReader(r.Body, 10<<20))
 	if err != nil {
@@ -308,7 +359,7 @@ func (h *ProxyHandler) handleEncrypted(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	slog.Debug("msg", "n", req.Header.N, "method", encBody.Method, "path", encBody.Path, "dh", req.Header.DH[:16])
+	slog.Debug("msg", "request_id", requestIDFromCtx(r.Context()), "n", req.Header.N, "method", encBody.Method, "path", encBody.Path, "dh", req.Header.DH[:16])
 
 	// Пересылаем на бэкенд (с circuit breaker)
 	cbEnabled := h.cfg.Load().CircuitBreaker.Enabled
@@ -326,7 +377,11 @@ func (h *ProxyHandler) handleEncrypted(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if cbEnabled {
-		h.cb.RecordSuccess()
+		if backendResp.StatusCode >= 500 {
+			h.cb.RecordFailure()
+		} else {
+			h.cb.RecordSuccess()
+		}
 	}
 	defer backendResp.Body.Close()
 
@@ -342,7 +397,11 @@ func (h *ProxyHandler) handleEncrypted(w http.ResponseWriter, r *http.Request) {
 		"headers": extractHeaders(backendResp.Header),
 		"body":    string(respBody),
 	}
-	encRespJSON, _ := json.Marshal(encResp)
+	encRespJSON, err := json.Marshal(encResp)
+	if err != nil {
+		jsonError(w, "internal error", http.StatusInternalServerError)
+		return
+	}
 
 	// Шифруем ответ
 	respPkt, err := sess.Encrypt(encRespJSON)
@@ -374,16 +433,35 @@ func (h *ProxyHandler) initSession(clientECDHPubHex string) (*RatchetSession, er
 
 // forwardToBackend пересылает расшифрованный запрос на бэкенд
 func (h *ProxyHandler) forwardToBackend(origReq *http.Request, enc *EncryptedBody) (*http.Response, error) {
-	method := enc.Method
+	// 1. Валидация метода
+	method := strings.ToUpper(enc.Method)
 	if method == "" {
 		method = origReq.Method
 	}
-	path := enc.Path
-	if path == "" {
-		path = origReq.URL.RequestURI()
+	if !allowedMethods[method] {
+		return nil, fmt.Errorf("invalid method: %q", method)
 	}
 
-	targetURL := h.cfg.Load().Backend + path
+	// 2. Нормализация и валидация пути
+	rawPath := enc.Path
+	if rawPath == "" {
+		rawPath = origReq.URL.RequestURI()
+	}
+	pathPart := rawPath
+	queryPart := ""
+	if idx := strings.IndexByte(rawPath, '?'); idx >= 0 {
+		pathPart = rawPath[:idx]
+		queryPart = rawPath[idx:]
+	}
+	cleanedPath := path.Clean("/" + strings.TrimPrefix(pathPart, "/"))
+	if strings.Contains(cleanedPath, "..") {
+		return nil, fmt.Errorf("invalid path: %q", enc.Path)
+	}
+	backendBase, err := url.Parse(h.cfg.Load().Backend)
+	if err != nil {
+		return nil, fmt.Errorf("invalid backend URL: %w", err)
+	}
+	targetURL := backendBase.JoinPath(cleanedPath).String() + queryPart
 
 	var bodyReader io.Reader
 	if enc.Body != "" {
@@ -395,17 +473,33 @@ func (h *ProxyHandler) forwardToBackend(origReq *http.Request, enc *EncryptedBod
 		return nil, err
 	}
 
-	// Копируем заголовки из зашифрованного пакета
+	// 3. Фильтрация заголовков из зашифрованного пакета
 	for k, v := range enc.Headers {
-		req.Header.Set(k, v)
+		canonical := http.CanonicalHeaderKey(k)
+		if blockedHeaders[canonical] {
+			continue
+		}
+		if strings.ContainsAny(v, "\r\n") {
+			continue // предотвращаем CRLF injection
+		}
+		req.Header.Set(canonical, v)
 	}
 	if req.Header.Get("Content-Type") == "" && enc.Body != "" {
 		req.Header.Set("Content-Type", "application/json")
 	}
 
-	// Реальный IP клиента
-	req.Header.Set("X-Forwarded-For", origReq.RemoteAddr)
-	req.Header.Set("X-Real-IP", origReq.RemoteAddr)
+	// 4. Реальный IP клиента (только хост, без порта)
+	clientHost, _, splitErr := net.SplitHostPort(origReq.RemoteAddr)
+	if splitErr != nil {
+		clientHost = origReq.RemoteAddr
+	}
+	req.Header.Set("X-Forwarded-For", clientHost)
+	req.Header.Set("X-Real-IP", clientHost)
+
+	// 5. Propagate request ID
+	if reqID := requestIDFromCtx(origReq.Context()); reqID != "" {
+		req.Header.Set("X-Request-ID", reqID)
+	}
 
 	return h.client.Do(req)
 }
@@ -439,4 +533,38 @@ func jsonError(w http.ResponseWriter, msg string, code int) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	fmt.Fprintf(w, `{"error":%q}`, msg)
+}
+
+// setCORSHeaders добавляет CORS-заголовки если origin разрешён конфигом.
+func (h *ProxyHandler) setCORSHeaders(w http.ResponseWriter, r *http.Request) {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return
+	}
+	cfg := h.cfg.Load()
+	if len(cfg.AllowedOrigins) == 0 {
+		return
+	}
+	for _, allowed := range cfg.AllowedOrigins {
+		if allowed == "*" || allowed == origin {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Session-ID")
+			return
+		}
+	}
+}
+
+// metricPath нормализует путь запроса до метки метрики (по конфигу маршрутов).
+// Предотвращает неограниченную кардинальность time series.
+func metricPath(cfg *Config, urlPath string) string {
+	for _, r := range cfg.Routes {
+		if strings.HasSuffix(r.Path, "/") && strings.HasPrefix(urlPath, r.Path) {
+			return r.Path
+		}
+		if urlPath == r.Path {
+			return r.Path
+		}
+	}
+	return "other"
 }

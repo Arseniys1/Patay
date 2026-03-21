@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 
 	"golang.org/x/crypto/hkdf"
@@ -260,6 +261,16 @@ func (s *RatchetSession) dhRatchet(newDHrHex string) error {
 	s.PN = s.Ns
 	s.Ns = 0
 	s.Nr = 0
+
+	// Удаляем пропущенные ключи старого DHr — они больше не нужны
+	if s.DHrHex != "" {
+		prefix := s.DHrHex + ":"
+		for k := range s.Skipped {
+			if strings.HasPrefix(k, prefix) {
+				delete(s.Skipped, k)
+			}
+		}
+	}
 
 	// Принимающий шаг
 	dhOut1, err := dhCompute(s.DHs, newDHrHex)
