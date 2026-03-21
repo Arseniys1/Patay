@@ -99,6 +99,12 @@ func (h *ProxyHandler) WaitWS() {
 	h.wsWg.Wait()
 }
 
+// StopBackground останавливает фоновые горутины (SessionStore и RateLimiter).
+func (h *ProxyHandler) StopBackground() {
+	h.store.Stop()
+	h.rateLimiter.Stop()
+}
+
 // statusRecorder оборачивает ResponseWriter для захвата статус-кода.
 type statusRecorder struct {
 	http.ResponseWriter
@@ -294,6 +300,12 @@ func (h *ProxyHandler) handleEncrypted(w http.ResponseWriter, r *http.Request) {
 	h.setCORSHeaders(w, r)
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	if h.cfg.Load().RateLimit.Enabled && !h.rateLimiter.Allow(clientIP(r)) {
+		h.m.rateLimitRejects.Inc()
+		jsonError(w, "rate limit exceeded", http.StatusTooManyRequests)
 		return
 	}
 
@@ -546,7 +558,13 @@ func (h *ProxyHandler) setCORSHeaders(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for _, allowed := range cfg.AllowedOrigins {
-		if allowed == "*" || allowed == origin {
+		if allowed == "*" {
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Session-ID")
+			return
+		}
+		if allowed == origin {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Session-ID")

@@ -22,7 +22,8 @@ type SessionStore struct {
 	mu      sync.RWMutex
 	entries map[string]*sessionEntry
 	ttl     time.Duration
-	max     int // 0 = без лимита
+	max     int           // 0 = без лимита
+	stop    chan struct{}  // сигнал остановки cleanupLoop
 }
 
 func newSessionStore(ttl time.Duration) *SessionStore {
@@ -34,20 +35,27 @@ func newSessionStoreWithMax(ttl time.Duration, max int) *SessionStore {
 		entries: make(map[string]*sessionEntry),
 		ttl:     ttl,
 		max:     max,
+		stop:    make(chan struct{}),
 	}
 	go s.cleanupLoop()
 	return s
 }
 
+// Stop останавливает фоновую горутину очистки.
+func (s *SessionStore) Stop() {
+	close(s.stop)
+}
+
 func (s *SessionStore) Get(id string) (*RatchetSession, bool) {
-	s.mu.RLock()
+	s.mu.Lock()
 	e, ok := s.entries[id]
-	s.mu.RUnlock()
+	if ok {
+		e.lastSeen = time.Now()
+	}
+	s.mu.Unlock()
 	if !ok {
 		return nil, false
 	}
-	// Обновляем lastSeen без полной блокировки (допускаем гонку на метке — некритично)
-	e.lastSeen = time.Now()
 	return e.sess, true
 }
 
@@ -79,19 +87,24 @@ func (s *SessionStore) Count() int {
 	return n
 }
 
-// cleanupLoop удаляет истёкшие сессии каждые ttl/2
+// cleanupLoop удаляет истёкшие сессии каждые ttl/2. Завершается при вызове Stop().
 func (s *SessionStore) cleanupLoop() {
 	ticker := time.NewTicker(s.ttl / 2)
 	defer ticker.Stop()
-	for range ticker.C {
-		now := time.Now()
-		s.mu.Lock()
-		for id, e := range s.entries {
-			if now.Sub(e.lastSeen) > s.ttl {
-				delete(s.entries, id)
+	for {
+		select {
+		case <-ticker.C:
+			now := time.Now()
+			s.mu.Lock()
+			for id, e := range s.entries {
+				if now.Sub(e.lastSeen) > s.ttl {
+					delete(s.entries, id)
+				}
 			}
+			s.mu.Unlock()
+		case <-s.stop:
+			return
 		}
-		s.mu.Unlock()
 	}
 }
 

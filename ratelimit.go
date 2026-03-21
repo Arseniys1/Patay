@@ -23,6 +23,7 @@ type IPRateLimiter struct {
 	rps      rate.Limit
 	burst    int
 	ttl      time.Duration
+	stop     chan struct{} // сигнал остановки cleanupLoop
 }
 
 type ipEntry struct {
@@ -37,9 +38,15 @@ func newIPRateLimiter(rps float64, burst int) *IPRateLimiter {
 		rps:      rate.Limit(rps),
 		burst:    burst,
 		ttl:      10 * time.Minute,
+		stop:     make(chan struct{}),
 	}
 	go rl.cleanupLoop()
 	return rl
+}
+
+// Stop останавливает фоновую горутину очистки.
+func (rl *IPRateLimiter) Stop() {
+	close(rl.stop)
 }
 
 // Allow возвращает true если запрос с данного IP разрешён.
@@ -59,15 +66,20 @@ func (rl *IPRateLimiter) Allow(ip string) bool {
 func (rl *IPRateLimiter) cleanupLoop() {
 	ticker := time.NewTicker(rl.ttl / 2)
 	defer ticker.Stop()
-	for range ticker.C {
-		deadline := time.Now().Add(-rl.ttl)
-		rl.mu.Lock()
-		for ip, e := range rl.limiters {
-			if e.lastSeen.Before(deadline) {
-				delete(rl.limiters, ip)
+	for {
+		select {
+		case <-ticker.C:
+			deadline := time.Now().Add(-rl.ttl)
+			rl.mu.Lock()
+			for ip, e := range rl.limiters {
+				if e.lastSeen.Before(deadline) {
+					delete(rl.limiters, ip)
+				}
 			}
+			rl.mu.Unlock()
+		case <-rl.stop:
+			return
 		}
-		rl.mu.Unlock()
 	}
 }
 

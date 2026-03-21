@@ -76,6 +76,7 @@ func main() {
 	if err := srv.Shutdown(ctx); err != nil {
 		slog.Error("shutdown error", "err", err)
 	}
+	handler.StopBackground()
 
 	// Ждём завершения всех WebSocket соединений (до 30 секунд)
 	wsDone := make(chan struct{})
